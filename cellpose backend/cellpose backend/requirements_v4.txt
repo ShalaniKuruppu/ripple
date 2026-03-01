@@ -1,0 +1,10 @@
+cellpose
+numpy<2
+opencv-python-headless
+Pillow
+fastapi
+uvicorn[standard]
+python-multipart
+fastapi[standard]
+uvicorn
+python-multipart

@@ -813,7 +813,11 @@ public class VideoAnnotationTool {
     private final int FRAME_JUMP_AMOUNT = 10;
 
     public static void main(String[] args) {
-        SwingUtilities.invokeLater(() -> new VideoAnnotationTool().initUI());
+        // Launch mode selection dialog to choose between Cell Segmentation and Video Annotation
+        SwingUtilities.invokeLater(() -> {
+            ModeLauncher launcher = new ModeLauncher();
+            launcher.showModeSelection();
+        });
     }
 
     private static class AnnotationState {
@@ -4248,7 +4252,7 @@ public class VideoAnnotationTool {
         defaults.put("TitledBorder.border", BorderFactory.createLineBorder(BORDER_DARK));
     }
 
-    private void initUI() {
+    public void initUI() {
         loadConfig();
         
         // Set theme Look and Feel

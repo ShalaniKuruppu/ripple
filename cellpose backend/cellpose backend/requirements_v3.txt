@@ -1,0 +1,7 @@
+cellpose==3.1.1.2
+numpy<2
+opencv-python-headless
+Pillow
+fastapi
+uvicorn[standard]
+python-multipart
