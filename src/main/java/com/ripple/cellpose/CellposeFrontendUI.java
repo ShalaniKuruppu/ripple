@@ -7,9 +7,10 @@ import java.awt.*;
 import java.awt.event.*;
 import java.awt.image.BufferedImage;
 import java.io.*;
-import java.net.HttpURLConnection;
-import java.net.URL;
-import java.nio.file.Files;
+import java.nio.file.Path;
+import java.nio.file.Paths;
+import java.util.ArrayList;
+import java.util.List;
 import javax.imageio.ImageIO;
 import org.json.JSONArray;
 import org.json.JSONObject;
@@ -18,7 +19,7 @@ import ij.io.Opener;
 
 /**
  * Standalone Cellpose Frontend (No Fiji/ImageJ Plugin Dependencies)
- * Connects to Cellpose Backend for cell segmentation.
+ * Runs Cellpose Backend models directly without requiring a separate server.
  */
 public class CellposeFrontendUI {
     
@@ -35,8 +36,10 @@ public class CellposeFrontendUI {
     private boolean showMask = true;
     private float maskOpacity = 0.5f;
     
-    // Backend connection
-    private String backendUrl;
+    // Backend paths
+    private Path backendDir;
+    private Path workerScript;
+    private Path modelsDir;
     
     // UI Components
     private JComboBox<String> modelTypeCombo;
@@ -55,7 +58,18 @@ public class CellposeFrontendUI {
     private Color[] colorMap;
     
     public CellposeFrontendUI(String backendUrl) {
-        this.backendUrl = backendUrl;
+        // Find backend directory
+        this.backendDir = findBackendDirectory();
+        if (this.backendDir != null) {
+            this.workerScript = backendDir.resolve("cellpose backend").resolve("worker.py");
+            this.modelsDir = backendDir.resolve("cellpose backend").resolve("models");
+            System.out.println("[Cellpose] Backend directory found: " + backendDir);
+            System.out.println("[Cellpose] Worker script: " + workerScript);
+            System.out.println("[Cellpose] Models directory: " + modelsDir);
+        } else {
+            System.err.println("[Cellpose] WARNING: Backend directory not found!");
+            System.err.println("[Cellpose] Working directory: " + System.getProperty("user.dir"));
+        }
         initializeColorMap();
     }
     
@@ -323,26 +337,106 @@ public class CellposeFrontendUI {
     }
     
     /**
-     * Load available models from backend.
+     * Find the backend directory from project root.
+     */
+    private Path findBackendDirectory() {
+        Path projectRoot = Paths.get(System.getProperty("user.dir"));
+        Path backendDir = projectRoot.resolve("cellpose backend");
+        
+        if (backendDir.toFile().exists() && backendDir.toFile().isDirectory()) {
+            return backendDir;
+        }
+        return null;
+    }
+    
+    /**
+     * Get Python executable path based on model type.
+     */
+    private String getPythonExecutable(String modelType) {
+        if (backendDir == null) {
+            return null;
+        }
+        
+        String venvName = modelType.equals("Cellpose3.1") ? "venv_v3" : "venv_v4";
+        Path pythonPath = backendDir.resolve("cellpose backend")
+                                    .resolve(venvName)
+                                    .resolve("Scripts")
+                                    .resolve("python.exe");
+        
+        if (pythonPath.toFile().exists()) {
+            return pythonPath.toString();
+        }
+        
+        // Fallback to system python
+        return "python";
+    }
+    
+    /**
+     * Load available models by scanning backend directories.
      */
     private void loadModels() {
         SwingWorker<JSONObject, Void> worker = new SwingWorker<>() {
             @Override
             protected JSONObject doInBackground() throws Exception {
-                URL url = new URL(backendUrl + "/getModels");
-                HttpURLConnection conn = (HttpURLConnection) url.openConnection();
-                conn.setRequestMethod("GET");
-                conn.setConnectTimeout(3000);
+                JSONObject models = new JSONObject();
                 
-                BufferedReader reader = new BufferedReader(new InputStreamReader(conn.getInputStream()));
-                StringBuilder response = new StringBuilder();
-                String line;
-                while ((line = reader.readLine()) != null) {
-                    response.append(line);
+                // Use LinkedHashSet to maintain order and avoid duplicates
+                java.util.LinkedHashSet<String> cellpose31Set = new java.util.LinkedHashSet<>();
+                java.util.LinkedHashSet<String> cellposeSAMSet = new java.util.LinkedHashSet<>();
+                
+                // Add built-in Cellpose 3.1 models first
+                cellpose31Set.add("cyto3");  // Built-in cytoplasm model
+                
+                // Scan for custom Cellpose 3.1 models if directory exists
+                if (modelsDir != null) {
+                    Path cellpose31Dir = modelsDir.resolve("Cellpose 3.1");
+                    if (cellpose31Dir.toFile().exists()) {
+                        File[] files = cellpose31Dir.toFile().listFiles();
+                        if (files != null) {
+                            for (File file : files) {
+                                // Add model files (with or without .pth extension, but skip README and directories)
+                                if (file.isFile() && !file.getName().equals("README.md")) {
+                                    cellpose31Set.add(file.getName());
+                                }
+                            }
+                        }
+                    }
                 }
-                reader.close();
                 
-                return new JSONObject(response.toString());
+                // Convert Set to JSONArray
+                JSONArray cellpose31Models = new JSONArray();
+                for (String model : cellpose31Set) {
+                    cellpose31Models.put(model);
+                }
+                models.put("Cellpose3.1", cellpose31Models);
+                
+                // Add built-in CellposeSAM models first
+                cellposeSAMSet.add("cpsam");  // Built-in SAM model
+                
+                // Scan for custom CellposeSAM models if directory exists
+                if (modelsDir != null) {
+                    Path cellposeSAMDir = modelsDir.resolve("CellposeSAM");
+                    if (cellposeSAMDir.toFile().exists()) {
+                        File[] files = cellposeSAMDir.toFile().listFiles();
+                        if (files != null) {
+                            for (File file : files) {
+                                // Add model files (with or without .pth extension, but skip README and directories)
+                                if (file.isFile() && !file.getName().equals("README.md")) {
+                                    cellposeSAMSet.add(file.getName());
+                                }
+                            }
+                        }
+                    }
+                }
+                
+                // Convert Set to JSONArray
+                JSONArray cellposeSAMModels = new JSONArray();
+                for (String model : cellposeSAMSet) {
+                    cellposeSAMModels.put(model);
+                }
+                models.put("CellposeSAM", cellposeSAMModels);
+                
+                return models;
             }
             
             @Override
@@ -356,9 +450,18 @@ public class CellposeFrontendUI {
                     for (int i = 0; i < modelList.length(); i++) {
                         modelNameCombo.addItem(modelList.getString(i));
                     }
-                    statusLabel.setText(" Models loaded successfully");
+                    
+                    int modelCount = modelList.length();
+                    if (modelCount > 0) {
+                        statusLabel.setText(" " + modelCount + " model(s) available");
+                    } else {
+                        statusLabel.setText(" No models found");
+                    }
                 } catch (Exception e) {
                     statusLabel.setText(" Error loading models: " + e.getMessage());
+                    // Add at least a default model so the UI is usable
+                    modelNameCombo.removeAllItems();
+                    modelNameCombo.addItem("cyto3");
                 }
             }
         };
@@ -404,13 +507,20 @@ public class CellposeFrontendUI {
     }
     
     /**
-     * Run segmentation.
+     * Run segmentation by directly executing worker.py.
      */
     private void runSegmentation() {
         if (originalImage == null) {
             JOptionPane.showMessageDialog(frame,
                 "Please load an image first.",
                 "No Image", JOptionPane.WARNING_MESSAGE);
+            return;
+        }
+        
+        if (workerScript == null || !workerScript.toFile().exists()) {
+            JOptionPane.showMessageDialog(frame,
+                "Worker script not found. Please check backend installation.",
+                "Backend Error", JOptionPane.ERROR_MESSAGE);
             return;
         }
         
@@ -426,108 +536,136 @@ public class CellposeFrontendUI {
                 File tempFile = File.createTempFile("cellpose_input_", ".png");
                 ImageIO.write(originalImage, "png", tempFile);
                 
-                // Build URL with query parameters
+                // Get parameters
                 String modelType = (String) modelTypeCombo.getSelectedItem();
                 String modelName = (String) modelNameCombo.getSelectedItem();
                 String diameter = String.valueOf(diameterSpinner.getValue());
                 String channels = channelsField.getText();
-                String useGpu = String.valueOf(useGpuCheckbox.isSelected());
+                boolean useGpu = useGpuCheckbox.isSelected();
                 String flowThreshold = String.valueOf(flowThresholdSpinner.getValue());
                 String cellprobThreshold = String.valueOf(cellprobThresholdSpinner.getValue());
                 
-                String urlStr = backendUrl + "/segment"
-                    + "?model_type=" + java.net.URLEncoder.encode(modelType, "UTF-8")
-                    + "&model_name=" + java.net.URLEncoder.encode(modelName, "UTF-8")
-                    + "&diameter=" + diameter
-                    + "&channels=" + java.net.URLEncoder.encode(channels, "UTF-8")
-                    + "&use_gpu=" + useGpu
-                    + "&flow_threshold=" + flowThreshold
-                    + "&cellprob_threshold=" + cellprobThreshold;
-                
-                // Prepare multipart request (only for the image file)
-                String boundary = "----WebKitFormBoundary" + System.currentTimeMillis();
-                String LINE_FEED = "\r\n";
-                
-                URL url = new URL(urlStr);
-                HttpURLConnection conn = (HttpURLConnection) url.openConnection();
-                conn.setDoOutput(true);
-                conn.setRequestMethod("POST");
-                conn.setRequestProperty("Content-Type", "multipart/form-data; boundary=" + boundary);
-                
-                OutputStream out = conn.getOutputStream();
-                PrintWriter writer = new PrintWriter(new OutputStreamWriter(out, "UTF-8"), true);
-                
-                // Add image file
-                writer.append("--").append(boundary).append(LINE_FEED);
-                writer.append("Content-Disposition: form-data; name=\"image\"; filename=\"").append(tempFile.getName()).append("\"").append(LINE_FEED);
-                writer.append("Content-Type: image/png").append(LINE_FEED);
-                writer.append(LINE_FEED);
-                writer.flush();
-                
-                // Write file bytes
-                FileInputStream fileInput = new FileInputStream(tempFile);
-                byte[] buffer = new byte[4096];
-                int bytesRead;
-                while ((bytesRead = fileInput.read(buffer)) != -1) {
-                    out.write(buffer, 0, bytesRead);
+                // Get Python executable
+                String pythonExe = getPythonExecutable(modelType);
+                if (pythonExe == null) {
+                    tempFile.delete();
+                    throw new Exception("Python executable not found for " + modelType);
                 }
-                out.flush();
-                fileInput.close();
                 
-                writer.append(LINE_FEED);
-                writer.flush();
+                publish("Initializing " + modelType + "/" + modelName + "...");
                 
-                // End multipart
-                writer.append("--").append(boundary).append("--").append(LINE_FEED);
-                writer.flush();
-                writer.close();
+                // Build command list
+                List<String> command = new ArrayList<>();
+                command.add(pythonExe);
+                command.add(workerScript.toString());
+                command.add("--image");
+                command.add(tempFile.getAbsolutePath());
+                command.add("--model_type");
+                command.add(modelType);
+                command.add("--model_name");
+                command.add(modelName);
+                command.add("--diameter");
+                command.add(diameter);
+                command.add("--channels");
+                command.add(channels);
+                command.add("--flow_threshold");
+                command.add(flowThreshold);
+                command.add("--cellprob_threshold");
+                command.add(cellprobThreshold);
                 
-                int responseCode = conn.getResponseCode();
-                if (responseCode == 200) {
-                    // Read JSON response
-                    BufferedReader reader = new BufferedReader(new InputStreamReader(conn.getInputStream()));
-                    StringBuilder responseText = new StringBuilder();
-                    String line;
-                    while ((line = reader.readLine()) != null) {
-                        responseText.append(line);
+                if (useGpu) {
+                    command.add("--use_gpu");
+                }
+                
+                // Debug: Log the command
+                System.out.println("[Cellpose] Executing command:");
+                System.out.println("[Cellpose] " + String.join(" ", command));
+                
+                // Build process
+                ProcessBuilder pb = new ProcessBuilder(command);
+                
+                // Set working directory to backend directory
+                pb.directory(workerScript.getParent().toFile());
+                pb.redirectErrorStream(false);
+                
+                System.out.println("[Cellpose] Working directory: " + pb.directory());
+                
+                publish("Running inference...");
+                
+                // Execute process
+                Process process = pb.start();
+                
+                // Read stdout (contains JSON result)
+                BufferedReader stdoutReader = new BufferedReader(
+                    new InputStreamReader(process.getInputStream()));
+                StringBuilder stdout = new StringBuilder();
+                String line;
+                while ((line = stdoutReader.readLine()) != null) {
+                    stdout.append(line);
+                }
+                stdoutReader.close();
+                
+                // Read stderr (contains logs)
+                BufferedReader stderrReader = new BufferedReader(
+                    new InputStreamReader(process.getErrorStream()));
+                StringBuilder stderr = new StringBuilder();
+                while ((line = stderrReader.readLine()) != null) {
+                    stderr.append(line).append("\n");
+                    // Log all stderr to console for debugging
+                    System.err.println("[Cellpose Worker] " + line);
+                    // Optionally publish progress messages from stderr
+                    if (line.contains("Inference complete") || line.contains("Starting inference")) {
+                        publish(line);
                     }
-                    reader.close();
-                    
-                    // Parse the JSON response
-                    JSONObject dataObj = new JSONObject(responseText.toString());
-                    String maskBase64 = dataObj.getString("mask_image");
-                    int numCells = dataObj.getInt("num_cells");
-                    
-                    // Update status with cell count
-                    publish("Found " + numCells + " cells");
-                    
-                    // Decode and create mask image
-                    byte[] maskBytes = java.util.Base64.getDecoder().decode(maskBase64);
-                    ByteArrayInputStream bis = new ByteArrayInputStream(maskBytes);
-                    BufferedImage rawMask = ImageIO.read(bis);
-                    
-                    tempFile.delete();
-                    return rawMask;
-                } else {
-                    // Read error response
-                    String errorMsg = "Status: " + responseCode;
-                    try {
-                        BufferedReader errorReader = new BufferedReader(new InputStreamReader(conn.getErrorStream()));
-                        StringBuilder errorText = new StringBuilder();
-                        String line;
-                        while ((line = errorReader.readLine()) != null) {
-                            errorText.append(line);
-                        }
-                        errorReader.close();
-                        if (errorText.length() > 0) {
-                            errorMsg += " - " + errorText.toString();
-                        }
-                    } catch (Exception e) {
-                        // Ignore
+                }
+                stderrReader.close();
+                
+                // Wait for process to complete
+                int exitCode = process.waitFor();
+                
+                System.out.println("[Cellpose] Process exited with code: " + exitCode);
+                
+                tempFile.delete();
+                
+                if (exitCode != 0) {
+                    String errorMsg = "Segmentation failed with exit code " + exitCode;
+                    if (stderr.length() > 0) {
+                        errorMsg += "\n\nError output:\n" + stderr.toString();
                     }
-                    tempFile.delete();
+                    throw new Exception(errorMsg);
+                }
+                
+                // Parse JSON output from stdout
+                String output = stdout.toString().trim();
+                System.out.println("[Cellpose] Stdout output: " + (output.length() > 100 ? output.substring(0, 100) + "..." : output));
+                
+                if (output.isEmpty()) {
+                    throw new Exception("No output from worker script\nError log:\n" + stderr.toString());
+                }
+                
+                JSONObject result = new JSONObject(output);
+                String status = result.getString("status");
+                
+                if (!status.equals("success")) {
+                    String errorMsg = result.optString("message", "Unknown error");
                     throw new Exception("Segmentation failed: " + errorMsg);
                 }
+                
+                // Extract data
+                String dataStr = result.getString("data");
+                JSONObject dataObj = new JSONObject(dataStr);
+                String maskBase64 = dataObj.getString("mask_image");
+                int numCells = dataObj.getInt("num_cells");
+                
+                // Update status with cell count
+                publish("Found " + numCells + " cells");
+                
+                // Decode and create mask image
+                byte[] maskBytes = java.util.Base64.getDecoder().decode(maskBase64);
+                ByteArrayInputStream bis = new ByteArrayInputStream(maskBytes);
+                BufferedImage rawMask = ImageIO.read(bis);
+                
+                return rawMask;
             }
             
             @Override
@@ -556,15 +694,6 @@ public class CellposeFrontendUI {
             }
         };
         worker.execute();
-    }
-    
-    private void addFormField(PrintWriter writer, String boundary, String name, String value) {
-        String LINE_FEED = "\r\n";
-        writer.append("--").append(boundary).append(LINE_FEED);
-        writer.append("Content-Disposition: form-data; name=\"").append(name).append("\"").append(LINE_FEED);
-        writer.append(LINE_FEED);
-        writer.append(value).append(LINE_FEED);
-        writer.flush();
     }
     
     /**

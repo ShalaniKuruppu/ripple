@@ -8,6 +8,7 @@ import numpy as np
 import base64
 from io import BytesIO
 from PIL import Image
+from pathlib import Path
 
 # --- LOGGING SETUP ---
 logging.basicConfig(
@@ -25,6 +26,11 @@ CELLPOSE_SAM_DIR = os.path.join(MODELS_DIR, "CellposeSAM")
 
 
 def main():
+    logger.info("="*60)
+    logger.info("CELLPOSE WORKER STARTED")
+    logger.info(f"Command line arguments: {sys.argv}")
+    logger.info("="*60)
+    
     parser = argparse.ArgumentParser()
     parser.add_argument("--image", required=True)
     parser.add_argument("--model_type", required=True, choices=["Cellpose3.1", "CellposeSAM"])
@@ -43,6 +49,14 @@ def main():
     parser.add_argument("--tile_norm", type=int, default=0, help="Tile normalization block size")
 
     args = parser.parse_args()
+    
+    logger.info(f"📋 Parsed arguments:")
+    logger.info(f"   Image path: {args.image}")
+    logger.info(f"   Model type: {args.model_type}")
+    logger.info(f"   Model name: {args.model_name}")
+    logger.info(f"   Diameter: {args.diameter}")
+    logger.info(f"   Channels: {args.channels}")
+    logger.info(f"   GPU: {args.use_gpu}")
 
     # 1. DETERMINE MODEL PATH BASED ON TYPE
     if args.model_type == "Cellpose3.1":
@@ -52,21 +66,42 @@ def main():
     
     model_path = os.path.join(model_dir, args.model_name)
     
+    # Normalize path to absolute path (handles Windows paths better)
+    model_path = os.path.abspath(model_path)
+    
+    logger.info(f"📍 Model path: {model_path}")
+    
     # 2. VERIFY MODEL EXISTS (skip for built-in models)
     if args.model_name not in ['cyto3', 'cpsam']:
         if not os.path.exists(model_path):
             logger.error(f"❌ CRITICAL ERROR: Model file not found at: {model_path}")
             print(json.dumps({"status": "error", "message": f"Model file missing: {model_path}"}))
             return
+        
+        logger.info(f"✓ Model file exists, size: {os.path.getsize(model_path)} bytes")
 
     try:
         from cellpose import models, utils
 
         # 2. LOAD IMAGE
+        logger.info(f"📂 Attempting to load image from: {args.image}")
+        logger.info(f"   File exists: {os.path.exists(args.image)}")
+        if os.path.exists(args.image):
+            logger.info(f"   File size: {os.path.getsize(args.image)} bytes")
+            logger.info(f"   Absolute path: {os.path.abspath(args.image)}")
+        
         # Note: cv2 loads as BGR. Cellpose generally expects RGB.
         img = cv2.imread(args.image, cv2.IMREAD_UNCHANGED)
         if img is None:
-            raise ValueError("Could not read image file")
+            # Try alternative loading method using PIL
+            logger.warning("⚠️ cv2.imread failed, trying PIL.Image.open...")
+            try:
+                pil_img = Image.open(args.image)
+                img = np.array(pil_img)
+                logger.info(f"✓ Successfully loaded image with PIL: shape {img.shape}")
+            except Exception as pil_error:
+                logger.error(f"❌ PIL also failed: {pil_error}")
+                raise ValueError(f"Could not read image file: {args.image}\nFile exists: {os.path.exists(args.image)}\nError: cv2.imread returned None")
 
         # Ensure image has 3 dimensions (H, W, C) if it's color
         # If grayscale (H, W), add channel dim -> (H, W, 1)

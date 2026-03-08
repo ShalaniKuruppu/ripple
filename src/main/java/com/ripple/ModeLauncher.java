@@ -159,13 +159,15 @@ public class ModeLauncher {
     
     /**
      * Launch the Cell Segmentation Tool.
-     * This will launch the Cellpose Frontend with backend management.
+     * Directly launches the Cellpose Frontend UI (no separate backend server needed).
      */
     private void launchCellSegmentationTool() {
         SwingUtilities.invokeLater(() -> {
             try {
-                // Launch the integrated Cellpose application (frontend + backend)
-                launchIntegratedCellposeApplication();
+                // Launch Cellpose Frontend directly
+                // Backend models are now executed on-demand when segmentation is run
+                CellposeFrontendUI frontend = new CellposeFrontendUI(null);
+                frontend.initUI();
             } catch (Exception e) {
                 e.printStackTrace();
                 JOptionPane.showMessageDialog(null,
