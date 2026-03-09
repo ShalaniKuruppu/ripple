@@ -52,8 +52,76 @@ java -jar target/ripple.jar
 mvn exec:java
 ```
 
-> Note: RIPPLE is a hybrid Java/Python app — you’ll typically still want your Conda environment set up so the Python tracking backend can run.
+> Note: RIPPLE is a hybrid Java/Python app — you’ll typically still want your Conda environment set up so the Python tracking backend can run.## 🔬 Cell Segmentation (Cellpose Backend)
 
+RIPPLE includes integrated Cellpose support for cell segmentation. The backend runs automatically when you start RIPPLE, but requires a one-time setup.
+
+### First-Time Setup
+
+Before running RIPPLE with cell segmentation features, set up the Cellpose environments:
+
+**Windows:**
+```cmd
+cd "cellpose backend\cellpose backend"
+.\setup_environments.bat
+cd ..\..
+```
+
+**Linux/macOS:**
+```bash
+cd "cellpose backend/cellpose backend"
+chmod +x setup_environments.sh
+./setup_environments.sh
+cd ../..
+```
+
+This creates two virtual environments:
+- `venv_v3` - For Cellpose 3.1 models
+- `venv_v4` - For CellposeSAM models
+
+### Running RIPPLE with Cellpose
+
+After the one-time setup, simply run RIPPLE from the project root:
+
+```bash
+java -jar target/ripple.jar
+```
+
+The Cellpose backend server will start automatically at `http://127.0.0.1:8000` and manage segmentation tasks in the background.
+
+### Using Quick Start (Recommended)
+
+Alternatively, use the quick start script which handles everything:
+
+**Windows:**
+```cmd
+.\quickstart.bat
+```
+
+**Linux/macOS:**
+```bash
+./quickstart.sh
+```
+
+### Manual Backend Control (Advanced)
+
+If you need to run the Cellpose backend separately:
+
+**Windows:**
+```cmd
+cd "cellpose backend\cellpose backend"
+.\start_backend_windows.bat
+```
+
+**Linux/macOS:**
+```bash
+cd "cellpose backend/cellpose backend"
+./start_backend_mac.sh
+```
+
+The backend provides REST API endpoints at:
+- `GET /getModels` - List available segmentation models
+- `POST /segment` - Perform cell segmentation
 ## 🧠 Persistent Tracking Server (optional)
 
 For iterative workflows, RIPPLE includes an optional long-running tracking server that keeps models warm in memory. The helper scripts manage the server lifecycle and forward tracking commands.
@@ -103,6 +171,16 @@ RIPPLE/
 │   ├── java/com/ripple/         # Java GUI application
 │   └── python/                  # Python tracking backend
 │
+├── cellpose backend/            # Cellpose segmentation backend
+│   └── cellpose backend/
+│       ├── app.py               # FastAPI backend server
+│       ├── worker.py            # Segmentation worker script
+│       ├── start_backend.py     # Backend launcher
+│       ├── setup_environments.bat # Windows environment setup
+│       ├── models/              # Cellpose model storage
+│       ├── venv_v3/             # Cellpose 3.1 environment
+│       └── venv_v4/             # CellposeSAM environment
+│
 ├── requirements/                # Python dependencies
 │   ├── requirements-cpu.txt     # CPU-only packages
 │   └── requirements-gpu.txt     # GPU (CUDA) packages
@@ -118,6 +196,7 @@ RIPPLE/
 
 ### System Requirements
 - **Java**: 11+ (17+ recommended)
+- **Python**: 3.8+ (for Cellpose backend)
 - **Conda**: Miniconda or Anaconda
 - **Maven**: 3.8+ (for building from source)
 
@@ -135,6 +214,11 @@ RIPPLE/
 ## 📖 Features
 
 - **Video Annotation**: Load and annotate TIFF video stacks
+- **Cell Segmentation**:
+  - Cellpose 3.1 models
+  - CellposeSAM models
+  - Custom model support
+  - Automatic backend management
 - **Particle Tracking**:
   - RAFT optical flow (GPU only)
   - LocoTrack point tracking (GPU only)
@@ -186,6 +270,7 @@ MIT License. See [LICENSE](https://github.com/Le0nZim/ripple/blob/main/LICENCE).
 ## 🙏 Acknowledgments
 
 - [ImageJ](https://fiji.sc/) - Image analysis platform
+- [Cellpose](https://github.com/MouseLand/cellpose) - Cell segmentation
 - [RAFT](https://github.com/princeton-vl/RAFT) - Optical flow
 - [LocoTrack](https://github.com/cvlab-kaist/locotrack) - Point tracking
 - [TrackPy](https://soft-matter.github.io/trackpy/v0.7/) - Particle tracking
