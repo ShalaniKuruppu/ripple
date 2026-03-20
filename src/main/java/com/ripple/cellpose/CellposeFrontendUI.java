@@ -6,13 +6,18 @@ import javax.swing.filechooser.FileNameExtensionFilter;
 import java.awt.*;
 import java.awt.event.*;
 import java.awt.image.BufferedImage;
+import java.awt.image.Raster;
 import java.io.*;
+import java.nio.charset.StandardCharsets;
 import java.nio.file.Path;
 import java.nio.file.Paths;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.HashSet;
 import java.util.List;
+import java.util.Locale;
+import java.util.Map;
+import java.util.TreeMap;
 import javax.imageio.ImageIO;
 import org.json.JSONArray;
 import org.json.JSONObject;
@@ -25,15 +30,59 @@ import ij.io.Opener;
  */
 public class CellposeFrontendUI {
 
+    private static class MaskPropertiesAccumulator {
+        final int label;
+        int area;
+        long sumX;
+        long sumY;
+        int minX = Integer.MAX_VALUE;
+        int minY = Integer.MAX_VALUE;
+        int maxX = Integer.MIN_VALUE;
+        int maxY = Integer.MIN_VALUE;
+        int boundaryPixels;
+
+        MaskPropertiesAccumulator(int label) {
+            this.label = label;
+        }
+
+        void addPixel(int x, int y) {
+            area++;
+            sumX += x;
+            sumY += y;
+            if (x < minX) {
+                minX = x;
+            }
+            if (y < minY) {
+                minY = y;
+            }
+            if (x > maxX) {
+                maxX = x;
+            }
+            if (y > maxY) {
+                maxY = y;
+            }
+        }
+
+        double centroidX() {
+            return area > 0 ? (double) sumX / area : 0.0;
+        }
+
+        double centroidY() {
+            return area > 0 ? (double) sumY / area : 0.0;
+        }
+    }
+
     private static class SegmentationResult {
         final BufferedImage rawMask;
         final BufferedImage coloredMask;
         final int numCells;
+        final boolean noMasksFound;
 
-        SegmentationResult(BufferedImage rawMask, BufferedImage coloredMask, int numCells) {
+        SegmentationResult(BufferedImage rawMask, BufferedImage coloredMask, int numCells, boolean noMasksFound) {
             this.rawMask = rawMask;
             this.coloredMask = coloredMask;
             this.numCells = numCells;
+            this.noMasksFound = noMasksFound;
         }
     }
 
@@ -727,6 +776,9 @@ public class CellposeFrontendUI {
         statusLabel.setText(" Running segmentation...");
         
         SwingWorker<BufferedImage, String> worker = new SwingWorker<>() {
+            private int savedMasksCount = 0;
+            private int noMasksCount = 0;
+
             @Override
             protected BufferedImage doInBackground() throws Exception {
                 String modelType = (String) modelTypeCombo.getSelectedItem();
@@ -769,9 +821,19 @@ public class CellposeFrontendUI {
                         parsedChannels
                     );
 
+                    if (result.noMasksFound) {
+                        noMasksCount++;
+                        publish("No masks found for " + imageFile.getName() + "; skipping.");
+                        continue;
+                    }
+
                     File outputMaskFile = buildMaskOutputFile(imageFile);
                     ImageIO.write(result.rawMask, "png", outputMaskFile);
-                    publish("Saved " + outputMaskFile.getName() + " (" + result.numCells + " cells)");
+                    File outputPropertiesFile = buildMaskPropertiesOutputFile(imageFile);
+                    writeMaskPropertiesCsv(result.rawMask, outputPropertiesFile);
+                    savedMasksCount++;
+                    publish("Saved " + outputMaskFile.getName() + " and "
+                        + outputPropertiesFile.getName() + " (" + result.numCells + " cells)");
 
                     if (currentImageFile != null && currentImageFile.equals(imageFile)) {
                         previewMask = result.coloredMask;
@@ -794,14 +856,15 @@ public class CellposeFrontendUI {
             protected void done() {
                 try {
                     maskImage = get();
-                    if (maskImage != null) {
-                        updateDisplay();
-                    }
+                    updateDisplay();
 
                     if (taskIsFolderBatch) {
                         String folderName = currentFolder != null ? currentFolder.getName() : "folder";
                         statusLabel.setText(" Segmentation completed for " + taskFiles.size()
-                            + " images in " + folderName + " (saved as *_mask.png)");
+                            + " images in " + folderName + ": "
+                            + savedMasksCount + " saved, " + noMasksCount + " with no masks");
+                    } else if (noMasksCount > 0 && currentImageFile != null) {
+                        statusLabel.setText(" No masks found for " + currentImageFile.getName());
                     } else if (currentImageFile != null) {
                         statusLabel.setText(" Segmentation completed: " + currentImageFile.getName());
                     } else {
@@ -848,6 +911,88 @@ public class CellposeFrontendUI {
         int dot = name.lastIndexOf('.');
         String base = dot > 0 ? name.substring(0, dot) : name;
         return new File(imageFile.getParentFile(), base + "_mask.png");
+    }
+
+    private File buildMaskPropertiesOutputFile(File imageFile) {
+        String name = imageFile.getName();
+        int dot = name.lastIndexOf('.');
+        String base = dot > 0 ? name.substring(0, dot) : name;
+        return new File(imageFile.getParentFile(), base + "_mask_properties.csv");
+    }
+
+    private void writeMaskPropertiesCsv(BufferedImage rawMask, File csvFile) throws IOException {
+        int width = rawMask.getWidth();
+        int height = rawMask.getHeight();
+        Raster raster = rawMask.getRaster();
+
+        Map<Integer, MaskPropertiesAccumulator> statsByLabel = new TreeMap<>();
+
+        for (int y = 0; y < height; y++) {
+            for (int x = 0; x < width; x++) {
+                int label = getMaskLabel(raster, x, y);
+                if (label <= 0) {
+                    continue;
+                }
+
+                MaskPropertiesAccumulator stats = statsByLabel.computeIfAbsent(
+                    label,
+                    MaskPropertiesAccumulator::new
+                );
+                stats.addPixel(x, y);
+            }
+        }
+
+        for (int y = 0; y < height; y++) {
+            for (int x = 0; x < width; x++) {
+                int label = getMaskLabel(raster, x, y);
+                if (label <= 0) {
+                    continue;
+                }
+                if (isBoundaryPixel(raster, width, height, x, y, label)) {
+                    MaskPropertiesAccumulator stats = statsByLabel.get(label);
+                    if (stats != null) {
+                        stats.boundaryPixels++;
+                    }
+                }
+            }
+        }
+
+        try (PrintWriter writer = new PrintWriter(new OutputStreamWriter(
+            new FileOutputStream(csvFile),
+            StandardCharsets.UTF_8
+        ))) {
+            writer.println("label,area_pixels,centroid_x,centroid_y,bbox_min_x,bbox_min_y,bbox_max_x,bbox_max_y,boundary_pixels");
+            for (MaskPropertiesAccumulator stats : statsByLabel.values()) {
+                writer.println(String.format(
+                    Locale.US,
+                    "%d,%d,%.4f,%.4f,%d,%d,%d,%d,%d",
+                    stats.label,
+                    stats.area,
+                    stats.centroidX(),
+                    stats.centroidY(),
+                    stats.minX,
+                    stats.minY,
+                    stats.maxX,
+                    stats.maxY,
+                    stats.boundaryPixels
+                ));
+            }
+        }
+    }
+
+    private int getMaskLabel(Raster raster, int x, int y) {
+        return raster.getNumBands() > 0 ? raster.getSample(x, y, 0) : 0;
+    }
+
+    private boolean isBoundaryPixel(Raster raster, int width, int height, int x, int y, int label) {
+        if (x == 0 || y == 0 || x == width - 1 || y == height - 1) {
+            return true;
+        }
+
+        return getMaskLabel(raster, x - 1, y) != label
+            || getMaskLabel(raster, x + 1, y) != label
+            || getMaskLabel(raster, x, y - 1) != label
+            || getMaskLabel(raster, x, y + 1) != label;
     }
 
     private SegmentationResult segmentImageFile(
@@ -927,6 +1072,9 @@ public class CellposeFrontendUI {
 
             File maskFile = findMaskOutput(outputDir, imageFile);
             if (maskFile == null || !maskFile.exists()) {
+                if (hasNoMasksMessage(processLog.toString())) {
+                    return new SegmentationResult(null, null, 0, true);
+                }
                 throw new Exception(
                     "Segmentation completed but mask file was not found for " + imageFile.getName() +
                         " in: " + outputDir + "\nExpected suffix: _cp_masks.png\n\nCLI output:\n" + processLog
@@ -940,10 +1088,17 @@ public class CellposeFrontendUI {
 
             int[] numCellsOut = new int[]{0};
             BufferedImage coloredMask = createColoredMaskFromLabels(rawMask, numCellsOut);
-            return new SegmentationResult(rawMask, coloredMask, numCellsOut[0]);
+            return new SegmentationResult(rawMask, coloredMask, numCellsOut[0], false);
         } finally {
             deleteRecursively(outputDir);
         }
+    }
+
+    private boolean hasNoMasksMessage(String processLog) {
+        if (processLog == null) {
+            return false;
+        }
+        return processLog.toLowerCase().contains("no masks found");
     }
 
     private String resolvePretrainedModelArg(String modelType, String modelName) throws Exception {
