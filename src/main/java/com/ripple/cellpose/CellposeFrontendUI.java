@@ -10,6 +10,7 @@ import java.io.*;
 import java.nio.file.Path;
 import java.nio.file.Paths;
 import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.HashSet;
 import java.util.List;
 import javax.imageio.ImageIO;
@@ -34,6 +35,14 @@ public class CellposeFrontendUI {
     private BufferedImage displayImage;
     private BufferedImage maskImage;
     private ImagePlus imagePlus;
+    private File currentImageFile;
+    private File currentFolder;
+    private JSplitPane fileBrowserSplitPane;
+    private JScrollPane imageScrollPane;
+    private JScrollPane folderListScrollPane;
+    private JPanel emptyFolderPanel;
+    private JList<File> folderFileList;
+    private DefaultListModel<File> folderFileListModel;
     
     // Display settings
     private double zoomFactor = 1.0;
@@ -131,6 +140,11 @@ public class CellposeFrontendUI {
         openItem.setAccelerator(KeyStroke.getKeyStroke(KeyEvent.VK_O, InputEvent.CTRL_DOWN_MASK));
         openItem.addActionListener(e -> openImage());
         fileMenu.add(openItem);
+
+        JMenuItem openFolderItem = new JMenuItem("Open Folder...");
+        openFolderItem.setAccelerator(KeyStroke.getKeyStroke(KeyEvent.VK_O, InputEvent.CTRL_DOWN_MASK | InputEvent.SHIFT_DOWN_MASK));
+        openFolderItem.addActionListener(e -> openFolder());
+        fileMenu.add(openFolderItem);
         
         fileMenu.addSeparator();
         
@@ -279,10 +293,59 @@ public class CellposeFrontendUI {
         imageLabel = new JLabel("No image loaded", SwingConstants.CENTER);
         imageLabel.setFont(new Font("Arial", Font.PLAIN, 16));
         imageLabel.setForeground(Color.GRAY);
-        
-        JScrollPane scrollPane = new JScrollPane(imageLabel);
-        scrollPane.setBackground(Color.DARK_GRAY);
-        panel.add(scrollPane, BorderLayout.CENTER);
+
+        imageScrollPane = new JScrollPane(imageLabel);
+        imageScrollPane.setBackground(Color.DARK_GRAY);
+
+        folderFileListModel = new DefaultListModel<>();
+        folderFileList = new JList<>(folderFileListModel);
+        folderFileList.setSelectionMode(ListSelectionModel.SINGLE_SELECTION);
+        folderFileList.setCellRenderer(new DefaultListCellRenderer() {
+            @Override
+            public Component getListCellRendererComponent(
+                JList<?> list,
+                Object value,
+                int index,
+                boolean isSelected,
+                boolean cellHasFocus
+            ) {
+                super.getListCellRendererComponent(list, value, index, isSelected, cellHasFocus);
+                if (value instanceof File file) {
+                    setText(file.getName());
+                }
+                return this;
+            }
+        });
+        folderFileList.addListSelectionListener(e -> {
+            if (e.getValueIsAdjusting()) {
+                return;
+            }
+
+            File selected = folderFileList.getSelectedValue();
+            if (selected == null) {
+                return;
+            }
+
+            if (loadImageFile(selected) && statusLabel != null) {
+                int index = folderFileList.getSelectedIndex() + 1;
+                int total = folderFileListModel.getSize();
+                String folderName = currentFolder != null ? currentFolder.getName() : selected.getParentFile().getName();
+                statusLabel.setText(" Folder: " + folderName + " | " + index + "/" + total + " | " + selected.getName());
+            }
+        });
+
+        folderListScrollPane = new JScrollPane(folderFileList);
+        folderListScrollPane.setBorder(BorderFactory.createTitledBorder("Folder Files"));
+        folderListScrollPane.setPreferredSize(new Dimension(240, 0));
+        folderListScrollPane.setMinimumSize(new Dimension(180, 0));
+
+        emptyFolderPanel = new JPanel();
+        fileBrowserSplitPane = new JSplitPane(JSplitPane.HORIZONTAL_SPLIT, emptyFolderPanel, imageScrollPane);
+        fileBrowserSplitPane.setResizeWeight(0.0);
+        fileBrowserSplitPane.setContinuousLayout(true);
+        fileBrowserSplitPane.setOneTouchExpandable(true);
+        panel.add(fileBrowserSplitPane, BorderLayout.CENTER);
+        setFolderListVisible(false);
         
         // Zoom controls
         JPanel zoomPanel = new JPanel(new FlowLayout(FlowLayout.CENTER));
@@ -489,31 +552,110 @@ public class CellposeFrontendUI {
         
         if (fileChooser.showOpenDialog(frame) == JFileChooser.APPROVE_OPTION) {
             File file = fileChooser.getSelectedFile();
-            try {
-                // Try ImageJ first for better TIFF support
-                Opener opener = new Opener();
-                imagePlus = opener.openImage(file.getAbsolutePath());
-                if (imagePlus != null) {
-                    originalImage = imagePlus.getBufferedImage();
-                } else {
-                    // Fallback to standard ImageIO
-                    originalImage = ImageIO.read(file);
-                }
-                
-                if (originalImage != null) {
-                    maskImage = null;
-                    zoomFit();
-                    statusLabel.setText(" Loaded: " + file.getName());
-                } else {
-                    JOptionPane.showMessageDialog(frame,
-                        "Failed to load image: " + file.getName(),
-                        "Load Error", JOptionPane.ERROR_MESSAGE);
-                }
-            } catch (Exception e) {
-                JOptionPane.showMessageDialog(frame,
-                    "Error loading image: " + e.getMessage(),
-                    "Load Error", JOptionPane.ERROR_MESSAGE);
+            if (loadImageFile(file)) {
+                currentFolder = null;
+                folderFileListModel.clear();
+                setFolderListVisible(false);
+                statusLabel.setText(" Loaded: " + file.getName());
             }
+        }
+    }
+
+    /**
+     * Open a folder and show a clickable file list with preview.
+     */
+    private void openFolder() {
+        JFileChooser folderChooser = new JFileChooser();
+        folderChooser.setDialogTitle("Select Folder with Images");
+        folderChooser.setFileSelectionMode(JFileChooser.DIRECTORIES_ONLY);
+        folderChooser.setAcceptAllFileFilterUsed(false);
+
+        if (folderChooser.showOpenDialog(frame) != JFileChooser.APPROVE_OPTION) {
+            return;
+        }
+
+        File folder = folderChooser.getSelectedFile();
+        File[] candidates = folder.listFiles((dir, name) -> {
+            return isSupportedImageName(name);
+        });
+
+        if (candidates == null || candidates.length == 0) {
+            JOptionPane.showMessageDialog(frame,
+                "No supported images found in folder:\n" + folder.getAbsolutePath(),
+                "Open Folder", JOptionPane.WARNING_MESSAGE);
+            return;
+        }
+
+        Arrays.sort(candidates, (a, b) -> a.getName().compareToIgnoreCase(b.getName()));
+        currentFolder = folder;
+        folderFileListModel.clear();
+        for (File candidate : candidates) {
+            folderFileListModel.addElement(candidate);
+        }
+        setFolderListVisible(true);
+        folderFileList.setSelectedIndex(0);
+        folderFileList.ensureIndexIsVisible(0);
+    }
+
+    private boolean isSupportedImageName(String name) {
+        String lower = name.toLowerCase();
+        return lower.endsWith(".tif")
+            || lower.endsWith(".tiff")
+            || lower.endsWith(".png")
+            || lower.endsWith(".jpg")
+            || lower.endsWith(".jpeg")
+            || lower.endsWith(".bmp");
+    }
+
+    private void setFolderListVisible(boolean visible) {
+        if (fileBrowserSplitPane == null) {
+            return;
+        }
+
+        if (visible) {
+            fileBrowserSplitPane.setLeftComponent(folderListScrollPane);
+            fileBrowserSplitPane.setDividerSize(8);
+            if (fileBrowserSplitPane.getDividerLocation() < 120) {
+                fileBrowserSplitPane.setDividerLocation(240);
+            }
+        } else {
+            fileBrowserSplitPane.setLeftComponent(emptyFolderPanel);
+            fileBrowserSplitPane.setDividerSize(0);
+            fileBrowserSplitPane.setDividerLocation(0);
+        }
+
+        fileBrowserSplitPane.revalidate();
+        fileBrowserSplitPane.repaint();
+    }
+
+    private boolean loadImageFile(File file) {
+        try {
+            // Try ImageJ first for better TIFF support
+            Opener opener = new Opener();
+            imagePlus = opener.openImage(file.getAbsolutePath());
+            if (imagePlus != null) {
+                originalImage = imagePlus.getBufferedImage();
+            } else {
+                // Fallback to standard ImageIO
+                originalImage = ImageIO.read(file);
+            }
+
+            if (originalImage != null) {
+                currentImageFile = file;
+                maskImage = null;
+                zoomFit();
+                return true;
+            }
+
+            JOptionPane.showMessageDialog(frame,
+                "Failed to load image: " + file.getName(),
+                "Load Error", JOptionPane.ERROR_MESSAGE);
+            return false;
+        } catch (Exception e) {
+            JOptionPane.showMessageDialog(frame,
+                "Error loading image: " + e.getMessage(),
+                "Load Error", JOptionPane.ERROR_MESSAGE);
+            return false;
         }
     }
     
@@ -667,7 +809,11 @@ public class CellposeFrontendUI {
                 try {
                     maskImage = get();
                     updateDisplay();
-                    statusLabel.setText(" Segmentation completed");
+                    if (currentImageFile != null) {
+                        statusLabel.setText(" Segmentation completed: " + currentImageFile.getName());
+                    } else {
+                        statusLabel.setText(" Segmentation completed");
+                    }
                     progressBar.setString("Completed");
                 } catch (Exception e) {
                     statusLabel.setText(" Segmentation failed: " + e.getMessage());
