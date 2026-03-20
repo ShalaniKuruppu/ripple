@@ -25,6 +25,18 @@ import ij.io.Opener;
  */
 public class CellposeFrontendUI {
 
+    private static class SegmentationResult {
+        final BufferedImage rawMask;
+        final BufferedImage coloredMask;
+        final int numCells;
+
+        SegmentationResult(BufferedImage rawMask, BufferedImage coloredMask, int numCells) {
+            this.rawMask = rawMask;
+            this.coloredMask = coloredMask;
+            this.numCells = numCells;
+        }
+    }
+
     private static final int LEFT_PANEL_WIDTH = 360;
     private static final int LEFT_PANEL_MIN_WIDTH = 360;
     
@@ -599,12 +611,25 @@ public class CellposeFrontendUI {
 
     private boolean isSupportedImageName(String name) {
         String lower = name.toLowerCase();
-        return lower.endsWith(".tif")
+        boolean supportedExtension = lower.endsWith(".tif")
             || lower.endsWith(".tiff")
             || lower.endsWith(".png")
             || lower.endsWith(".jpg")
             || lower.endsWith(".jpeg")
             || lower.endsWith(".bmp");
+        return supportedExtension && !isGeneratedMaskName(lower);
+    }
+
+    private boolean isGeneratedMaskName(String lowerName) {
+        if (lowerName.endsWith("_cp_masks.png")) {
+            return true;
+        }
+        int dot = lowerName.lastIndexOf('.');
+        if (dot <= 0) {
+            return false;
+        }
+        String base = lowerName.substring(0, dot);
+        return base.endsWith("_mask");
     }
 
     private void setFolderListVisible(boolean visible) {
@@ -669,6 +694,32 @@ public class CellposeFrontendUI {
                 "No Image", JOptionPane.WARNING_MESSAGE);
             return;
         }
+
+        List<File> filesToProcess = getFilesForSegmentation();
+        if (filesToProcess.isEmpty()) {
+            JOptionPane.showMessageDialog(frame,
+                "No valid images available for segmentation.",
+                "No Images", JOptionPane.WARNING_MESSAGE);
+            return;
+        }
+
+        boolean isFolderBatch = currentFolder != null && filesToProcess.size() > 1;
+        if (isFolderBatch) {
+            int confirm = JOptionPane.showConfirmDialog(
+                frame,
+                "Run segmentation for all " + filesToProcess.size() + " images in this folder?\n"
+                    + "Output files will be saved next to each image as <name>_mask.png",
+                "Batch Segmentation",
+                JOptionPane.OK_CANCEL_OPTION,
+                JOptionPane.QUESTION_MESSAGE
+            );
+            if (confirm != JOptionPane.OK_OPTION) {
+                return;
+            }
+        }
+
+        final List<File> taskFiles = new ArrayList<>(filesToProcess);
+        final boolean taskIsFolderBatch = isFolderBatch;
         
         segmentButton.setEnabled(false);
         progressBar.setIndeterminate(true);
@@ -678,123 +729,58 @@ public class CellposeFrontendUI {
         SwingWorker<BufferedImage, String> worker = new SwingWorker<>() {
             @Override
             protected BufferedImage doInBackground() throws Exception {
-                // Save image to temp file
-                File tempFile = File.createTempFile("cellpose_input_", ".png");
-                ImageIO.write(originalImage, "png", tempFile);
+                String modelType = (String) modelTypeCombo.getSelectedItem();
+                String modelName = (String) modelNameCombo.getSelectedItem();
+                String diameter = String.valueOf(diameterSpinner.getValue());
+                String channels = channelsField.getText();
+                boolean useGpu = useGpuCheckbox.isSelected();
+                String flowThreshold = String.valueOf(flowThresholdSpinner.getValue());
+                String cellprobThreshold = String.valueOf(cellprobThresholdSpinner.getValue());
 
-                // CLI requires an existing output directory.
-                File outputDir = new File(System.getProperty("java.io.tmpdir"), "cellpose_out_" + System.nanoTime());
-                if (!outputDir.mkdirs() && !outputDir.exists()) {
-                    tempFile.delete();
-                    throw new Exception("Failed to create temporary output directory: " + outputDir);
+                if (modelType == null || modelName == null) {
+                    throw new Exception("Please select a valid model type and model.");
                 }
-                
-                try {
-                    // Get parameters
-                    String modelType = (String) modelTypeCombo.getSelectedItem();
-                    String modelName = (String) modelNameCombo.getSelectedItem();
-                    String diameter = String.valueOf(diameterSpinner.getValue());
-                    String channels = channelsField.getText();
-                    boolean useGpu = useGpuCheckbox.isSelected();
-                    String flowThreshold = String.valueOf(flowThresholdSpinner.getValue());
-                    String cellprobThreshold = String.valueOf(cellprobThresholdSpinner.getValue());
 
-                    // Get Python executable
-                    String pythonExe = getPythonExecutable(modelType);
-                    if (pythonExe == null) {
-                        throw new Exception("Python executable not found for " + modelType);
-                    }
-
-                    String pretrainedModelArg = resolvePretrainedModelArg(modelType, modelName);
-                    int[] parsedChannels = parseChannels(channels);
-
-                    publish("Initializing " + modelType + "/" + modelName + "...");
-
-                    // Build CLI command: python -m cellpose ...
-                    List<String> command = new ArrayList<>();
-                    command.add(pythonExe);
-                    command.add("-m");
-                    command.add("cellpose");
-                    command.add("--image_path");
-                    command.add(tempFile.getAbsolutePath());
-                    command.add("--pretrained_model");
-                    command.add(pretrainedModelArg);
-                    command.add("--diameter");
-                    command.add(diameter);
-                    command.add("--flow_threshold");
-                    command.add(flowThreshold);
-                    command.add("--cellprob_threshold");
-                    command.add(cellprobThreshold);
-                    command.add("--save_png");
-                    command.add("--savedir");
-                    command.add(outputDir.getAbsolutePath());
-                    command.add("--no_npy");
-
-                    // Channels are meaningful for Cellpose 3.1; SAM marks these as deprecated.
-                    if ("Cellpose3.1".equals(modelType)) {
-                        command.add("--chan");
-                        command.add(String.valueOf(parsedChannels[0]));
-                        command.add("--chan2");
-                        command.add(String.valueOf(parsedChannels[1]));
-                    }
-
-                    if (useGpu) {
-                        command.add("--use_gpu");
-                    }
-
-                    // Debug: Log the command
-                    System.out.println("[Cellpose CLI] Executing command:");
-                    System.out.println("[Cellpose CLI] " + String.join(" ", command));
-
-                    ProcessBuilder pb = new ProcessBuilder(command);
-                    pb.directory(backendDir.resolve("cellpose backend").toFile());
-                    pb.redirectErrorStream(true);
-
-                    System.out.println("[Cellpose CLI] Working directory: " + pb.directory());
-
-                    publish("Running inference...");
-
-                    Process process = pb.start();
-
-                    BufferedReader processReader = new BufferedReader(
-                        new InputStreamReader(process.getInputStream()));
-                    StringBuilder processLog = new StringBuilder();
-                    String line;
-                    while ((line = processReader.readLine()) != null) {
-                        processLog.append(line).append("\n");
-                        System.out.println("[Cellpose CLI] " + line);
-                    }
-                    processReader.close();
-
-                    int exitCode = process.waitFor();
-                    System.out.println("[Cellpose CLI] Process exited with code: " + exitCode);
-
-                    if (exitCode != 0) {
-                        throw new Exception("Segmentation failed with exit code " + exitCode + "\n\nCLI output:\n" + processLog);
-                    }
-
-                    File maskFile = findMaskOutput(outputDir, tempFile);
-                    if (maskFile == null || !maskFile.exists()) {
-                        throw new Exception(
-                            "Segmentation completed but mask file was not found in: " + outputDir +
-                            "\nExpected suffix: _cp_masks.png\n\nCLI output:\n" + processLog
-                        );
-                    }
-
-                    BufferedImage rawMask = ImageIO.read(maskFile);
-                    if (rawMask == null) {
-                        throw new Exception("Could not read generated mask file: " + maskFile);
-                    }
-
-                    int[] numCellsOut = new int[]{0};
-                    BufferedImage coloredMask = createColoredMaskFromLabels(rawMask, numCellsOut);
-                    publish("Found " + numCellsOut[0] + " cells");
-
-                    return coloredMask;
-                } finally {
-                    tempFile.delete();
-                    deleteRecursively(outputDir);
+                String pythonExe = getPythonExecutable(modelType);
+                if (pythonExe == null) {
+                    throw new Exception("Python executable not found for " + modelType);
                 }
+
+                String pretrainedModelArg = resolvePretrainedModelArg(modelType, modelName);
+                int[] parsedChannels = parseChannels(channels);
+
+                publish("Initializing " + modelType + "/" + modelName + "...");
+
+                BufferedImage previewMask = null;
+                int total = taskFiles.size();
+                for (int i = 0; i < total; i++) {
+                    File imageFile = taskFiles.get(i);
+                    publish("[" + (i + 1) + "/" + total + "] Segmenting " + imageFile.getName() + "...");
+
+                    SegmentationResult result = segmentImageFile(
+                        imageFile,
+                        pythonExe,
+                        modelType,
+                        pretrainedModelArg,
+                        diameter,
+                        flowThreshold,
+                        cellprobThreshold,
+                        useGpu,
+                        parsedChannels
+                    );
+
+                    File outputMaskFile = buildMaskOutputFile(imageFile);
+                    ImageIO.write(result.rawMask, "png", outputMaskFile);
+                    publish("Saved " + outputMaskFile.getName() + " (" + result.numCells + " cells)");
+
+                    if (currentImageFile != null && currentImageFile.equals(imageFile)) {
+                        previewMask = result.coloredMask;
+                    } else if (previewMask == null) {
+                        previewMask = result.coloredMask;
+                    }
+                }
+
+                return previewMask;
             }
             
             @Override
@@ -808,12 +794,20 @@ public class CellposeFrontendUI {
             protected void done() {
                 try {
                     maskImage = get();
-                    updateDisplay();
-                    if (currentImageFile != null) {
+                    if (maskImage != null) {
+                        updateDisplay();
+                    }
+
+                    if (taskIsFolderBatch) {
+                        String folderName = currentFolder != null ? currentFolder.getName() : "folder";
+                        statusLabel.setText(" Segmentation completed for " + taskFiles.size()
+                            + " images in " + folderName + " (saved as *_mask.png)");
+                    } else if (currentImageFile != null) {
                         statusLabel.setText(" Segmentation completed: " + currentImageFile.getName());
                     } else {
                         statusLabel.setText(" Segmentation completed");
                     }
+
                     progressBar.setString("Completed");
                 } catch (Exception e) {
                     statusLabel.setText(" Segmentation failed: " + e.getMessage());
@@ -827,6 +821,129 @@ public class CellposeFrontendUI {
             }
         };
         worker.execute();
+    }
+
+    private List<File> getFilesForSegmentation() {
+        List<File> files = new ArrayList<>();
+
+        if (currentFolder != null && folderFileListModel != null && folderFileListModel.getSize() > 0) {
+            for (int i = 0; i < folderFileListModel.getSize(); i++) {
+                File file = folderFileListModel.getElementAt(i);
+                if (file != null && file.isFile() && isSupportedImageName(file.getName())) {
+                    files.add(file);
+                }
+            }
+            return files;
+        }
+
+        if (currentImageFile != null && currentImageFile.isFile()) {
+            files.add(currentImageFile);
+        }
+
+        return files;
+    }
+
+    private File buildMaskOutputFile(File imageFile) {
+        String name = imageFile.getName();
+        int dot = name.lastIndexOf('.');
+        String base = dot > 0 ? name.substring(0, dot) : name;
+        return new File(imageFile.getParentFile(), base + "_mask.png");
+    }
+
+    private SegmentationResult segmentImageFile(
+        File imageFile,
+        String pythonExe,
+        String modelType,
+        String pretrainedModelArg,
+        String diameter,
+        String flowThreshold,
+        String cellprobThreshold,
+        boolean useGpu,
+        int[] parsedChannels
+    ) throws Exception {
+        File outputDir = new File(System.getProperty("java.io.tmpdir"), "cellpose_out_" + System.nanoTime());
+        if (!outputDir.mkdirs() && !outputDir.exists()) {
+            throw new Exception("Failed to create temporary output directory: " + outputDir);
+        }
+
+        try {
+            List<String> command = new ArrayList<>();
+            command.add(pythonExe);
+            command.add("-m");
+            command.add("cellpose");
+            command.add("--image_path");
+            command.add(imageFile.getAbsolutePath());
+            command.add("--pretrained_model");
+            command.add(pretrainedModelArg);
+            command.add("--diameter");
+            command.add(diameter);
+            command.add("--flow_threshold");
+            command.add(flowThreshold);
+            command.add("--cellprob_threshold");
+            command.add(cellprobThreshold);
+            command.add("--save_png");
+            command.add("--savedir");
+            command.add(outputDir.getAbsolutePath());
+            command.add("--no_npy");
+
+            if ("Cellpose3.1".equals(modelType)) {
+                command.add("--chan");
+                command.add(String.valueOf(parsedChannels[0]));
+                command.add("--chan2");
+                command.add(String.valueOf(parsedChannels[1]));
+            }
+
+            if (useGpu) {
+                command.add("--use_gpu");
+            }
+
+            System.out.println("[Cellpose CLI] Executing command:");
+            System.out.println("[Cellpose CLI] " + String.join(" ", command));
+
+            ProcessBuilder pb = new ProcessBuilder(command);
+            pb.directory(backendDir.resolve("cellpose backend").toFile());
+            pb.redirectErrorStream(true);
+
+            System.out.println("[Cellpose CLI] Working directory: " + pb.directory());
+
+            Process process = pb.start();
+
+            BufferedReader processReader = new BufferedReader(new InputStreamReader(process.getInputStream()));
+            StringBuilder processLog = new StringBuilder();
+            String line;
+            while ((line = processReader.readLine()) != null) {
+                processLog.append(line).append("\n");
+                System.out.println("[Cellpose CLI] " + line);
+            }
+            processReader.close();
+
+            int exitCode = process.waitFor();
+            System.out.println("[Cellpose CLI] Process exited with code: " + exitCode);
+
+            if (exitCode != 0) {
+                throw new Exception("Segmentation failed for " + imageFile.getName() + " with exit code " + exitCode
+                    + "\n\nCLI output:\n" + processLog);
+            }
+
+            File maskFile = findMaskOutput(outputDir, imageFile);
+            if (maskFile == null || !maskFile.exists()) {
+                throw new Exception(
+                    "Segmentation completed but mask file was not found for " + imageFile.getName() +
+                        " in: " + outputDir + "\nExpected suffix: _cp_masks.png\n\nCLI output:\n" + processLog
+                );
+            }
+
+            BufferedImage rawMask = ImageIO.read(maskFile);
+            if (rawMask == null) {
+                throw new Exception("Could not read generated mask file: " + maskFile);
+            }
+
+            int[] numCellsOut = new int[]{0};
+            BufferedImage coloredMask = createColoredMaskFromLabels(rawMask, numCellsOut);
+            return new SegmentationResult(rawMask, coloredMask, numCellsOut[0]);
+        } finally {
+            deleteRecursively(outputDir);
+        }
     }
 
     private String resolvePretrainedModelArg(String modelType, String modelName) throws Exception {
